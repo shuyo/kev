@@ -34,6 +34,7 @@ same buffers and the bucket joins `pending`; capture_pending() captures them lat
 waiting). Replays run one at a time (kev.serve has one model thread), each refills what it reads, and its results are
 copied out before the next replay; that is what makes the shared buffers and the shared memory pool safe.
 """
+import os
 from collections import OrderedDict
 from typing import NamedTuple
 
@@ -42,14 +43,27 @@ from transformers import DynamicCache
 from transformers.cache_utils import DynamicLayer, LinearAttentionLayer
 
 # Limits of the graphed passes (not the model's context: that is kev.model.MAX_STATE / SERVE_MAX_STATE)
-GRAPH_TOKENS = 32768   # rows x positions one row pass may hold in the attention buffers (about 1 GB on Kev-4B and 9B)
+GRAPH_TOKENS = int(os.environ.get("KEV_GRAPH_TOKENS", "32768"))   # rows x positions one row pass may hold in the attention buffers (about 1 GB on Kev-4B and 9B; KEV_GRAPH_TOKENS)
 GRAPH_STATE = 1024     # longest state bucket the state pass graphs. A longer state pass is compute-bound, and the padding plus
                        # the explicit mask (no causal flash attention) made a 2,200-token one slower as a graph (L40S, Kev-4B:
                        # 223 vs 208 ms per request), so it runs eagerly
 GRAPH_ROW = 1024       # longest question-row bucket the row pass graphs
 GRAPH_ROWS = 32        # question rows per graphed pass; more run as several replays
-GRAPH_STATES = 16      # states per state pass: the bank's entries
-BANK_WIDTH = 4096      # positions per bank entry (states are right-aligned in it; about 2 GB for 16 entries on Kev-4B and 9B)
+GRAPH_STATES = int(os.environ.get("KEV_GRAPH_STATES", "16"))   # states per state pass: the bank's entries (KEV_GRAPH_STATES)
+BANK_WIDTH = int(os.environ.get("KEV_GRAPH_BANK_WIDTH", "4096"))   # positions per bank entry (states are right-aligned in it; about 2 GB for 16 entries on Kev-4B and 9B; KEV_GRAPH_BANK_WIDTH)
+
+
+def _check_limits():
+    """The graphed passes need room for their own largest shapes: a state pass writes a state of up to GRAPH_STATE tokens
+    into a bank entry, and a row pass holds one row of up to GRAPH_ROW tokens after a state of up to BANK_WIDTH positions
+    (its group size is GRAPH_TOKENS // (state + row), which must be at least one). Smaller values fail at import, not at
+    the first request."""
+    if min(GRAPH_STATES, BANK_WIDTH, GRAPH_TOKENS) < 1: raise ValueError("KEV_GRAPH_STATES, KEV_GRAPH_BANK_WIDTH and KEV_GRAPH_TOKENS must be positive")
+    if BANK_WIDTH < GRAPH_STATE: raise ValueError(f"KEV_GRAPH_BANK_WIDTH={BANK_WIDTH} is below GRAPH_STATE={GRAPH_STATE}: a graphed state pass would not fit a bank entry")
+    if GRAPH_TOKENS < GRAPH_ROW + BANK_WIDTH: raise ValueError(f"KEV_GRAPH_TOKENS={GRAPH_TOKENS} is below GRAPH_ROW + KEV_GRAPH_BANK_WIDTH = {GRAPH_ROW + BANK_WIDTH}: a row pass after the longest cached state would not fit")
+
+
+_check_limits()
 GRAPHS_KEPT = 256      # captured graphs kept, least recently used evicted (a busy server met ~160 on mixed traffic)
 PASS_TOKENS = 256      # tokens a pass costs however few it holds: below about this many, a pass is bound by reading the
                        # weights, not by compute (bf16 GEMMs: peak FLOP/s over memory bandwidth is ~200-400 on H100, H200, B200, L40S)
@@ -186,6 +200,9 @@ class CudaGraphs:
         self.bank_views = self.bank.views(GRAPH_STATES, BANK_WIDTH)
         self.rowbuf = Buffers(probe, GRAPH_TOKENS, GRAPH_ROWS, self.device)
         self.hidden = torch.zeros(GRAPH_ROWS * GRAPH_ROW * lm.config.hidden_size, dtype=self.dtype, device=self.device)
+        nbytes = self.hidden.numel() * self.hidden.element_size() + sum(t.numel() * t.element_size() for _, flats, _ in self.bank.slots + self.rowbuf.slots for t in flats)
+        print(f"kev.cuda_graphs: fixed buffers {nbytes / 2**30:.2f} GiB (KEV_GRAPH_STATES={GRAPH_STATES}, KEV_GRAPH_BANK_WIDTH={BANK_WIDTH}, "
+              f"KEV_GRAPH_TOKENS={GRAPH_TOKENS})", flush=True)
 
     def _cache(self, views, filled, previous):
         """A DynamicCache over buffer views: attention layers hold `filled` cached positions, DeltaNet layers the states."""

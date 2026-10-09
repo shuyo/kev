@@ -2,6 +2,7 @@
 Run: uv run --extra serve python -m pytest tests/test_unit.py -q
 """
 import math
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -404,6 +405,25 @@ def test_rows_hidden_replicates_cache_without_changing_prefix(monkeypatch):
     assert torch.all(kv.keys == 1) and torch.all(kv.values == 2)
     assert torch.all(linear.conv_states[0] == 1) and torch.all(linear.recurrent_states[0] == 3)
     assert linear.has_previous_state[0] and len(cache.layers) == 2
+
+
+def _graph_limits(env):
+    """Import kev.cuda_graphs in a fresh process with these KEV_GRAPH_* variables: its limits, or the error it raises."""
+    import subprocess, sys
+    code = "import kev.cuda_graphs as g; print(g.GRAPH_STATES, g.BANK_WIDTH, g.GRAPH_TOKENS)"
+    base = {k: v for k, v in os.environ.items() if not k.startswith("KEV_GRAPH_")}
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env={**base, **env})
+    return run.stdout.split() if run.returncode == 0 else run.stderr.strip().splitlines()[-1]
+
+
+def test_graph_buffer_limits_come_from_the_environment_and_are_checked():
+    """KEV_GRAPH_STATES / KEV_GRAPH_BANK_WIDTH / KEV_GRAPH_TOKENS set the graphed passes' fixed buffers. The defaults are the
+    values every measurement used; a value too small for the passes' own shapes fails at import."""
+    assert _graph_limits({}) == ["16", "4096", "32768"]
+    assert _graph_limits({"KEV_GRAPH_STATES": "4", "KEV_GRAPH_BANK_WIDTH": "2048", "KEV_GRAPH_TOKENS": "8192"}) == ["4", "2048", "8192"]
+    assert "KEV_GRAPH_TOKENS=4096 is below" in _graph_limits({"KEV_GRAPH_TOKENS": "4096"})
+    assert "KEV_GRAPH_BANK_WIDTH=512 is below" in _graph_limits({"KEV_GRAPH_BANK_WIDTH": "512"})
+    assert "must be positive" in _graph_limits({"KEV_GRAPH_STATES": "0"})
 
 
 def test_bearer_auth_and_request_id(monkeypatch):
